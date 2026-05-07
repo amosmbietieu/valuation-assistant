@@ -1,8 +1,8 @@
 """
 cashflow.py — Cash Flow Analysis Engine (Alpha Vantage version)
 ================================================================
-Alpha Vantage CASH_FLOW annualReports fields:
-  - operatingCashflow       (positive = cash in)
+Alpha Vantage CASH_FLOW annualReports field names:
+  - operatingCashflow       (positive = cash generated)
   - capitalExpenditures     (positive number — AV reports CapEx as POSITIVE)
 
 FCF = operatingCashflow - capitalExpenditures
@@ -19,13 +19,12 @@ def compute_free_cash_flow(
     Compute Free Cash Flow from Alpha Vantage annualReports list.
 
     Args:
-        cashflow_data: list of annual cash flow dicts from Alpha Vantage
-                       (most recent first, fields are STRING values)
-
+        cashflow_data : list of annual dicts, most recent first.
+                        All numeric fields are STRING values in AV.
     Returns:
-        Tuple of:
-            - pd.Series  FCF indexed by fiscalDateEnding (or None)
-            - dict       debug / red flags
+        Tuple:
+            - pd.Series  FCF indexed by fiscalDateEnding  (or None)
+            - dict       debug / red_flags
     """
     debug = {
         "ocf_key_used":   "operatingCashflow",
@@ -41,36 +40,38 @@ def compute_free_cash_flow(
 
     dates, fcf_values = [], []
 
-    for entry in cashflow_data[:5]:   # max 5 years
+    for entry in cashflow_data[:5]:
         if not debug["available_keys"]:
             debug["available_keys"] = list(entry.keys())
 
-        date  = entry.get("fiscalDateEnding", "N/A")
+        date      = entry.get("fiscalDateEnding", "N/A")
+        ocf_raw   = entry.get("operatingCashflow",    "None")
+        capex_raw = entry.get("capitalExpenditures",  "None")
 
-        # Alpha Vantage returns numeric strings — "None" means missing
-        ocf_raw   = entry.get("operatingCashflow", "None")
-        capex_raw = entry.get("capitalExpenditures", "None")
+        # Alpha Vantage uses the string "None" for missing values
+        def to_float(v):
+            if v in (None, "", "None"):
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
 
-        try:
-            ocf = float(ocf_raw) if ocf_raw not in ("None", "", None) else None
-        except ValueError:
-            ocf = None
-
-        try:
-            # AV reports CapEx as a POSITIVE number — subtract from OCF
-            capex = float(capex_raw) if capex_raw not in ("None", "", None) else None
-        except ValueError:
-            capex = None
+        ocf   = to_float(ocf_raw)
+        capex = to_float(capex_raw)
 
         if ocf is None:
             debug["warnings"].append(f"operatingCashflow missing for {date}")
             continue
 
         if capex is None:
-            debug["warnings"].append(f"capitalExpenditures missing for {date} — using OCF as FCF")
-            capex = 0
+            debug["warnings"].append(
+                f"capitalExpenditures missing for {date} — FCF = OCF only"
+            )
+            capex = 0.0
 
-        fcf = ocf - capex    # Note: subtract because AV CapEx is positive
+        # AV reports CapEx as a POSITIVE number → subtract from OCF
+        fcf = ocf - capex
         dates.append(date)
         fcf_values.append(fcf)
 
@@ -80,21 +81,28 @@ def compute_free_cash_flow(
 
     fcf_series = pd.Series(data=fcf_values, index=dates)
 
-    # ── Red Flag Detection ─────────────────────────────────────────────────────
-    if (fcf_series < 0).all():
+    # ── Red Flag Detection ────────────────────────────────────────────────────
+    # Only flag truly negative FCF
+    negative_count = int((fcf_series < 0).sum())
+
+    if negative_count == len(fcf_series):
         debug["red_flags"].append(
             "🚨 FCF NEGATIVE across ALL periods — business is burning cash."
         )
-    elif (fcf_series < 0).any():
+    elif negative_count > 0:
         debug["red_flags"].append(
-            "⚠️ FCF turned negative in some periods — monitor the trend."
+            f"⚠️ FCF was negative in {negative_count} of {len(fcf_series)} periods — monitor the trend."
         )
 
-    # Check if CapEx is eroding strong OCF
+    # "Declining" flag: only if the MOST RECENT year is significantly lower
+    # than the prior year (>20% drop). Never trigger on older dips.
     if len(fcf_values) >= 2:
-        if fcf_values[0] < fcf_values[1] * 0.8:
+        latest = fcf_values[0]
+        prior  = fcf_values[1]
+        # Only meaningful if prior year was positive
+        if prior > 0 and latest < prior * 0.80:
             debug["red_flags"].append(
-                "⚠️ FCF declining year-over-year — investigate CapEx or revenue trends."
+                "⚠️ FCF declined >20% year-over-year — investigate CapEx or revenue trends."
             )
 
     return fcf_series, debug

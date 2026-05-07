@@ -8,8 +8,7 @@ AI:   Anthropic Claude API         — free at console.anthropic.com
 
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+import plotly.graph_objects as go
 
 from src.data_loader import load_financials, get_key_metrics
 from src.cashflow    import compute_free_cash_flow
@@ -216,24 +215,29 @@ if ticker and analyze:
     fcf_df = pd.DataFrame({
         "Fiscal Year": fcf_series.index,
         "FCF":         [format_value(v) for v in fcf_series.values],
-        "Raw ($)":     [f"${v:,.0f}" for v in fcf_series.values],
+        "Raw ($)":     [f"${v:+,.0f}" for v in fcf_series.values],
     }).set_index("Fiscal Year")
     st.dataframe(fcf_df, use_container_width=True)
 
-    # FCF Bar Chart
-    fig, ax = plt.subplots(figsize=(9, 3.5))
-    fig.patch.set_facecolor("#1a1d26"); ax.set_facecolor("#1a1d26")
-    colors = ["#00d4aa" if v >= 0 else "#f75050" for v in fcf_series.values]
-    bars = ax.bar(fcf_series.index, fcf_series.values / 1e9, color=colors, width=0.6, alpha=0.85, edgecolor="none")
-    ax.axhline(0, color="#2a2e3e", linewidth=1)
-    ax.set_ylabel("FCF ($ Billions)", color="#7a7f9a", fontsize=9)
-    ax.tick_params(colors="#7a7f9a", labelsize=8)
-    [s.set_color("#2a2e3e") for s in ax.spines.values()]
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.1f}B"))
-    for bar, val in zip(bars, fcf_series.values):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + abs(max(fcf_series.values)/1e9)*0.02,
-                format_value(val), ha="center", va="bottom", color="#e8eaf0", fontsize=8)
-    plt.tight_layout(); st.pyplot(fig); plt.close()
+    # FCF Bar Chart (Plotly)
+    bar_colors = ["#00d4aa" if v >= 0 else "#f75050" for v in fcf_series.values]
+    fig1 = go.Figure(go.Bar(
+        x=list(fcf_series.index),
+        y=[round(v / 1e9, 2) for v in fcf_series.values],
+        marker_color=bar_colors,
+        text=[format_value(v) for v in fcf_series.values],
+        textposition="outside",
+        hovertemplate="%{x}<br>FCF: %{text}<extra></extra>",
+    ))
+    fig1.update_layout(
+        plot_bgcolor="#1a1d26", paper_bgcolor="#1a1d26",
+        font=dict(color="#7a7f9a", size=12),
+        yaxis=dict(tickformat="$.1fB", ticksuffix="B", gridcolor="#2a2e3e", zerolinecolor="#4a4f6a"),
+        xaxis=dict(gridcolor="#2a2e3e"),
+        margin=dict(l=10, r=10, t=20, b=10),
+        height=320, showlegend=False,
+    )
+    st.plotly_chart(fig1, use_container_width=True)
 
     # ── DCF Valuation ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header"><h2>🏦 DCF Valuation — Scenario Analysis</h2></div>', unsafe_allow_html=True)
