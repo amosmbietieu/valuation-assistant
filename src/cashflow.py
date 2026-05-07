@@ -1,138 +1,97 @@
 """
-cashflow.py — Cash Flow Analysis Engine
-=========================================
-Computes Free Cash Flow (FCF) from Yahoo Finance statements.
-Implements multi-key fallback logic to handle Yahoo Finance's
-inconsistent naming across tickers and time periods.
+cashflow.py — Cash Flow Analysis Engine (FMP version)
+======================================================
+Computes Free Cash Flow from FMP cash-flow-statement data.
+
+FMP returns a clean list of dicts with standardised field names,
+so no more multi-key fallback parsing needed.
+
+FCF = operatingCashFlow + capitalExpenditure
+(FMP reports capitalExpenditure as a NEGATIVE number — addition is correct)
 """
 
 import pandas as pd
 from typing import Optional, Tuple
 
 
-# ─── Key Aliases ──────────────────────────────────────────────────────────────
-# Yahoo Finance uses different field names across tickers and API versions.
-# We attempt each alias in order until one is found.
-
-OCF_KEYS = [
-    "Operating Cash Flow",
-    "Total Cash From Operating Activities",
-    "Cash From Operations",
-    "Net Cash Provided By Operating Activities",
-    "CashFlowFromContinuingOperatingActivities",
-]
-
-CAPEX_KEYS = [
-    "Capital Expenditure",
-    "Capital Expenditures",
-    "CapEx",
-    "Purchase Of Property Plant And Equipment",
-    "Purchases Of Property And Equipment",
-    "Net PPE Purchase And Sale",
-]
-
-
-# ─── Core Function ────────────────────────────────────────────────────────────
-
 def compute_free_cash_flow(
-    cashflow_df: Optional[pd.DataFrame],
+    cashflow_data: Optional[list],
 ) -> Tuple[Optional[pd.Series], dict]:
     """
-    Compute Free Cash Flow: FCF = Operating Cash Flow − CapEx
-
-    Yahoo Finance reports CapEx as a negative number (cash outflow),
-    so the formula FCF = OCF + CapEx (signed) is mathematically correct.
+    Compute Free Cash Flow from FMP cash-flow-statement list.
 
     Args:
-        cashflow_df: Cash flow DataFrame from Yahoo Finance
-                     (rows = line items, columns = dates)
+        cashflow_data: list of annual cash flow dicts from FMP API
+                       (most recent first)
 
     Returns:
         Tuple of:
-            - pd.Series of FCF values indexed by date (or None on failure)
-            - dict with debug info: keys found, warnings, red_flags
+            - pd.Series  FCF values indexed by fiscal year date (or None)
+            - dict       debug info with warnings and red_flags
     """
     debug = {
-        "ocf_key_used": None,
-        "capex_key_used": None,
+        "ocf_key_used":   "operatingCashFlow",
+        "capex_key_used": "capitalExpenditure",
         "available_keys": [],
-        "warnings": [],
-        "red_flags": [],
+        "warnings":       [],
+        "red_flags":      [],
     }
 
-    if cashflow_df is None or cashflow_df.empty:
-        debug["warnings"].append("Cash flow DataFrame is empty or None.")
+    if not cashflow_data:
+        debug["warnings"].append("Cash flow data is empty or None.")
         return None, debug
 
-    # Normalize index once
-    cashflow_df = cashflow_df.copy()
-    cashflow_df.index = cashflow_df.index.astype(str).str.strip()
-    debug["available_keys"] = list(cashflow_df.index)
+    dates, fcf_values = [], []
 
-    # ── Find Operating Cash Flow ──────────────────────────────────────────────
-    ocf = _find_row(cashflow_df, OCF_KEYS)
-    if ocf is None:
-        debug["warnings"].append(
-            f"Operating Cash Flow not found. Tried: {OCF_KEYS}"
-        )
+    for entry in cashflow_data:
+        debug["available_keys"] = list(entry.keys())
+
+        ocf   = entry.get("operatingCashFlow")
+        capex = entry.get("capitalExpenditure")   # negative in FMP
+        date  = entry.get("date", "N/A")
+
+        if ocf is None:
+            debug["warnings"].append(f"operatingCashFlow missing for {date}")
+            continue
+        if capex is None:
+            # Fallback: FCF = OCF only
+            debug["warnings"].append(
+                f"capitalExpenditure missing for {date} — using OCF as FCF."
+            )
+            capex = 0
+
+        try:
+            fcf = float(ocf) + float(capex)   # capex is already negative
+            dates.append(date)
+            fcf_values.append(fcf)
+        except (ValueError, TypeError):
+            debug["warnings"].append(f"Non-numeric cash flow values for {date}")
+
+    if not fcf_values:
+        debug["warnings"].append("Could not compute FCF for any period.")
         return None, debug
-    debug["ocf_key_used"] = _matching_key(cashflow_df, OCF_KEYS)
 
-    # ── Find Capital Expenditures ─────────────────────────────────────────────
-    capex = _find_row(cashflow_df, CAPEX_KEYS)
-    if capex is None:
-        debug["warnings"].append(
-            f"CapEx not found. Tried: {CAPEX_KEYS}. FCF = OCF (CapEx assumed 0)."
-        )
-        # Fallback: FCF = OCF (conservative)
-        fcf = ocf.dropna()
-        debug["capex_key_used"] = "NOT FOUND — assumed 0"
-    else:
-        debug["capex_key_used"] = _matching_key(cashflow_df, CAPEX_KEYS)
-        # CapEx is already negative in Yahoo Finance → addition is correct
-        fcf = (ocf + capex).dropna()
+    fcf_series = pd.Series(data=fcf_values, index=dates)
 
     # ── Red Flag Detection ────────────────────────────────────────────────────
-    if (fcf < 0).all():
+    if (fcf_series < 0).all():
         debug["red_flags"].append(
-            "🚨 FCF is NEGATIVE across all periods — business burns cash."
+            "🚨 FCF is NEGATIVE across ALL periods — business is burning cash."
         )
-    elif (fcf < 0).any():
+    elif (fcf_series < 0).any():
         debug["red_flags"].append(
-            "⚠️  FCF turned negative in some periods — monitor trend."
+            "⚠️ FCF turned negative in some periods — monitor the trend closely."
         )
 
-    if ocf is not None and capex is not None:
-        if (ocf > 0).all() and (fcf < 0).any():
+    ocf_vals = [
+        float(e.get("operatingCashFlow", 0))
+        for e in cashflow_data
+        if e.get("operatingCashFlow") is not None
+    ]
+    if ocf_vals and all(o > 0 for o in ocf_vals):
+        if (fcf_series < 0).any():
             debug["red_flags"].append(
-                "⚠️  High CapEx is consuming all operating cash flow."
+                "⚠️ High CapEx is consuming operating cash flow — growth investment phase."
             )
 
-    return fcf, debug
-
-
-def compute_ocf_summary(cashflow_df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
-    """Return just the Operating Cash Flow series."""
-    if cashflow_df is None or cashflow_df.empty:
-        return None
-    cashflow_df = cashflow_df.copy()
-    cashflow_df.index = cashflow_df.index.astype(str).str.strip()
-    return _find_row(cashflow_df, OCF_KEYS)
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _find_row(df: pd.DataFrame, keys: list) -> Optional[pd.Series]:
-    """Return the first matching row from a list of candidate keys."""
-    for key in keys:
-        if key in df.index:
-            return pd.to_numeric(df.loc[key], errors="coerce")
-    return None
-
-
-def _matching_key(df: pd.DataFrame, keys: list) -> Optional[str]:
-    """Return the first key from the list that exists in the DataFrame index."""
-    for key in keys:
-        if key in df.index:
-            return key
-    return None
+    return fcf_series, debug

@@ -1,122 +1,144 @@
 """
-data_loader.py — Yahoo Finance Data Fetcher
-============================================
-Fetches and normalizes financial statements for a given ticker.
+data_loader.py — Financial Modeling Prep (FMP) Data Fetcher
+=============================================================
+Replaces yfinance with the FMP REST API, which works reliably
+on Streamlit Cloud without rate-limiting issues.
 
-NOTE: yfinance >= 0.2.40 requires curl_cffi internally and does NOT
-accept a custom requests.Session. We let yfinance manage its own
-session entirely — no patching needed.
+Free tier: 250 requests/day — sufficient for this app.
+Get your free API key at: https://financialmodelingprep.com
 """
 
-import yfinance as yf
+import requests
 import pandas as pd
+from typing import Optional
+
+BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 
-def load_financials(ticker: str) -> dict:
+def _get(endpoint: str, api_key: str, params: dict = None) -> Optional[list]:
     """
-    Fetch all financial statements for a ticker from Yahoo Finance.
+    Make a GET request to the FMP API.
+    Returns parsed JSON list, or None on any error.
+    """
+    url = f"{BASE_URL}/{endpoint}"
+    p = {"apikey": api_key, **(params or {})}
+    try:
+        resp = requests.get(url, params=p, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        # FMP returns {"Error Message": "..."} on bad key / unknown ticker
+        if isinstance(data, dict) and "Error Message" in data:
+            return None
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def load_financials(ticker: str, api_key: str) -> dict:
+    """
+    Fetch all financial statements for a ticker from FMP.
 
     Args:
-        ticker (str): Stock symbol (e.g., "AAPL", "MSFT")
+        ticker  : Stock symbol (e.g., "AAPL", "MSFT")
+        api_key : FMP API key
 
     Returns:
         dict with keys:
-            - cashflow     : pd.DataFrame  (cash flow statement)
-            - income       : pd.DataFrame  (income statement)
-            - balance      : pd.DataFrame  (balance sheet)
-            - info         : dict          (market cap, sector, P/E, etc.)
-            - ticker       : str           (normalised ticker)
-            - error        : str | None    (error message if any)
+            - cashflow  : list of annual cash flow dicts
+            - income    : list of annual income statement dicts
+            - balance   : list of annual balance sheet dicts
+            - profile   : dict with company info + market data
+            - metrics   : dict with key valuation metrics
+            - ticker    : str
+            - error     : str | None
     """
     result = {
         "cashflow": None,
         "income":   None,
         "balance":  None,
-        "info":     {},
+        "profile":  {},
+        "metrics":  {},
         "ticker":   ticker.upper().strip(),
         "error":    None,
     }
 
-    try:
-        # Let yfinance use its own internal curl_cffi session
-        stock = yf.Ticker(ticker)
+    if not api_key or not api_key.strip():
+        result["error"] = (
+            "FMP API key is missing. "
+            "Please enter your key in the sidebar. "
+            "Get a free key at financialmodelingprep.com"
+        )
+        return result
 
-        # ── Cash Flow Statement ───────────────────────────────────────────────
-        cf = stock.cashflow
-        if cf is not None and not cf.empty:
-            cf.index = cf.index.astype(str).str.strip()
-            result["cashflow"] = cf
+    t = ticker.upper().strip()
 
-        # ── Income Statement ──────────────────────────────────────────────────
-        inc = stock.financials
-        if inc is not None and not inc.empty:
-            inc.index = inc.index.astype(str).str.strip()
-            result["income"] = inc
+    # ── Cash Flow Statement ───────────────────────────────────────────────────
+    cf = _get(f"cash-flow-statement/{t}", api_key, {"limit": 5})
+    if cf:
+        result["cashflow"] = cf
 
-        # ── Balance Sheet ─────────────────────────────────────────────────────
-        bal = stock.balance_sheet
-        if bal is not None and not bal.empty:
-            bal.index = bal.index.astype(str).str.strip()
-            result["balance"] = bal
+    # ── Income Statement ──────────────────────────────────────────────────────
+    inc = _get(f"income-statement/{t}", api_key, {"limit": 5})
+    if inc:
+        result["income"] = inc
 
-        # ── Company Info ──────────────────────────────────────────────────────
-        info = stock.info
-        if info:
-            result["info"] = info
+    # ── Balance Sheet ─────────────────────────────────────────────────────────
+    bal = _get(f"balance-sheet-statement/{t}", api_key, {"limit": 5})
+    if bal:
+        result["balance"] = bal
 
-        # ── Validity check ────────────────────────────────────────────────────
-        if (
-            result["cashflow"] is None
-            and result["income"]  is None
-            and result["balance"] is None
-        ):
-            result["error"] = (
-                f"No financial data found for '{ticker}'. "
-                "Please verify the ticker symbol is correct "
-                "and listed on a supported exchange."
-            )
+    # ── Company Profile (includes price, market cap, sector…) ────────────────
+    prof = _get(f"profile/{t}", api_key)
+    if prof and len(prof) > 0:
+        result["profile"] = prof[0]
 
-    except Exception as e:
-        err = str(e)
-        if "Too Many Requests" in err or "429" in err:
-            result["error"] = (
-                "Yahoo Finance rate limit reached. "
-                "Please wait 30 seconds and try again."
-            )
-        elif "No data found" in err or "404" in err:
-            result["error"] = (
-                f"Ticker '{ticker}' not found. "
-                "Check the symbol and try again."
-            )
-        else:
-            result["error"] = f"Data fetch failed for '{ticker}': {err}"
+    # ── Key Metrics (P/E, EV/EBITDA, ROE…) ───────────────────────────────────
+    met = _get(f"key-metrics/{t}", api_key, {"limit": 1})
+    if met and len(met) > 0:
+        result["metrics"] = met[0]
+
+    # ── Validity check ────────────────────────────────────────────────────────
+    if (
+        result["cashflow"] is None
+        and result["income"]  is None
+        and result["balance"] is None
+        and not result["profile"]
+    ):
+        result["error"] = (
+            f"No data found for '{ticker}'. "
+            "Check the ticker symbol. "
+            "Note: some non-US tickers require the exchange suffix (e.g. 'VOD.L')."
+        )
 
     return result
 
 
-def get_key_metrics(info: dict) -> dict:
+def get_key_metrics(profile: dict, metrics: dict) -> dict:
     """
-    Extract key market metrics from the Yahoo Finance info dict.
-    Returns a clean dict of the most relevant valuation metrics.
+    Build a unified metrics dict from FMP profile + key-metrics endpoints.
+    Field names match the rest of the app exactly.
     """
     return {
-        "company_name":       info.get("longName", "N/A"),
-        "sector":             info.get("sector", "N/A"),
-        "industry":           info.get("industry", "N/A"),
-        "country":            info.get("country", "N/A"),
-        "market_cap":         info.get("marketCap"),
-        "current_price":      info.get("currentPrice") or info.get("regularMarketPrice"),
-        "pe_ratio":           info.get("trailingPE"),
-        "forward_pe":         info.get("forwardPE"),
-        "peg_ratio":          info.get("pegRatio"),
-        "ev_ebitda":          info.get("enterpriseToEbitda"),
-        "debt_to_equity":     info.get("debtToEquity"),
-        "revenue_growth":     info.get("revenueGrowth"),
-        "earnings_growth":    info.get("earningsGrowth"),
-        "profit_margin":      info.get("profitMargins"),
-        "roe":                info.get("returnOnEquity"),
-        "beta":               info.get("beta"),
-        "52w_high":           info.get("fiftyTwoWeekHigh"),
-        "52w_low":            info.get("fiftyTwoWeekLow"),
-        "shares_outstanding": info.get("sharesOutstanding"),
+        "company_name":       profile.get("companyName", "N/A"),
+        "sector":             profile.get("sector", "N/A"),
+        "industry":           profile.get("industry", "N/A"),
+        "country":            profile.get("country", "N/A"),
+        "market_cap":         profile.get("mktCap"),
+        "current_price":      profile.get("price"),
+        "pe_ratio":           metrics.get("peRatio"),
+        "forward_pe":         None,   # not in FMP free tier
+        "peg_ratio":          metrics.get("pegRatio"),
+        "ev_ebitda":          metrics.get("enterpriseValueOverEBITDA"),
+        "debt_to_equity":     metrics.get("debtToEquity"),
+        "revenue_growth":     None,   # computed from income statements if needed
+        "earnings_growth":    None,
+        "profit_margin":      metrics.get("netProfitMargin"),
+        "roe":                metrics.get("roe"),
+        "beta":               profile.get("beta"),
+        "52w_high":           profile.get("range", "").split("-")[-1].strip() if profile.get("range") else None,
+        "52w_low":            profile.get("range", "").split("-")[0].strip() if profile.get("range") else None,
+        "shares_outstanding": profile.get("sharesOutstanding"),
+        "description":        profile.get("description", ""),
+        "website":            profile.get("website", ""),
+        "exchange":           profile.get("exchangeShortName", ""),
     }
