@@ -1,13 +1,11 @@
 """
-cashflow.py — Cash Flow Analysis Engine (FMP version)
-======================================================
-Computes Free Cash Flow from FMP cash-flow-statement data.
+cashflow.py — Cash Flow Analysis Engine (Alpha Vantage version)
+================================================================
+Alpha Vantage CASH_FLOW annualReports fields:
+  - operatingCashflow       (positive = cash in)
+  - capitalExpenditures     (positive number — AV reports CapEx as POSITIVE)
 
-FMP returns a clean list of dicts with standardised field names,
-so no more multi-key fallback parsing needed.
-
-FCF = operatingCashFlow + capitalExpenditure
-(FMP reports capitalExpenditure as a NEGATIVE number — addition is correct)
+FCF = operatingCashflow - capitalExpenditures
 """
 
 import pandas as pd
@@ -18,20 +16,20 @@ def compute_free_cash_flow(
     cashflow_data: Optional[list],
 ) -> Tuple[Optional[pd.Series], dict]:
     """
-    Compute Free Cash Flow from FMP cash-flow-statement list.
+    Compute Free Cash Flow from Alpha Vantage annualReports list.
 
     Args:
-        cashflow_data: list of annual cash flow dicts from FMP API
-                       (most recent first)
+        cashflow_data: list of annual cash flow dicts from Alpha Vantage
+                       (most recent first, fields are STRING values)
 
     Returns:
         Tuple of:
-            - pd.Series  FCF values indexed by fiscal year date (or None)
-            - dict       debug info with warnings and red_flags
+            - pd.Series  FCF indexed by fiscalDateEnding (or None)
+            - dict       debug / red flags
     """
     debug = {
-        "ocf_key_used":   "operatingCashFlow",
-        "capex_key_used": "capitalExpenditure",
+        "ocf_key_used":   "operatingCashflow",
+        "capex_key_used": "capitalExpenditures",
         "available_keys": [],
         "warnings":       [],
         "red_flags":      [],
@@ -43,29 +41,38 @@ def compute_free_cash_flow(
 
     dates, fcf_values = [], []
 
-    for entry in cashflow_data:
-        debug["available_keys"] = list(entry.keys())
+    for entry in cashflow_data[:5]:   # max 5 years
+        if not debug["available_keys"]:
+            debug["available_keys"] = list(entry.keys())
 
-        ocf   = entry.get("operatingCashFlow")
-        capex = entry.get("capitalExpenditure")   # negative in FMP
-        date  = entry.get("date", "N/A")
+        date  = entry.get("fiscalDateEnding", "N/A")
 
-        if ocf is None:
-            debug["warnings"].append(f"operatingCashFlow missing for {date}")
-            continue
-        if capex is None:
-            # Fallback: FCF = OCF only
-            debug["warnings"].append(
-                f"capitalExpenditure missing for {date} — using OCF as FCF."
-            )
-            capex = 0
+        # Alpha Vantage returns numeric strings — "None" means missing
+        ocf_raw   = entry.get("operatingCashflow", "None")
+        capex_raw = entry.get("capitalExpenditures", "None")
 
         try:
-            fcf = float(ocf) + float(capex)   # capex is already negative
-            dates.append(date)
-            fcf_values.append(fcf)
-        except (ValueError, TypeError):
-            debug["warnings"].append(f"Non-numeric cash flow values for {date}")
+            ocf = float(ocf_raw) if ocf_raw not in ("None", "", None) else None
+        except ValueError:
+            ocf = None
+
+        try:
+            # AV reports CapEx as a POSITIVE number — subtract from OCF
+            capex = float(capex_raw) if capex_raw not in ("None", "", None) else None
+        except ValueError:
+            capex = None
+
+        if ocf is None:
+            debug["warnings"].append(f"operatingCashflow missing for {date}")
+            continue
+
+        if capex is None:
+            debug["warnings"].append(f"capitalExpenditures missing for {date} — using OCF as FCF")
+            capex = 0
+
+        fcf = ocf - capex    # Note: subtract because AV CapEx is positive
+        dates.append(date)
+        fcf_values.append(fcf)
 
     if not fcf_values:
         debug["warnings"].append("Could not compute FCF for any period.")
@@ -73,25 +80,21 @@ def compute_free_cash_flow(
 
     fcf_series = pd.Series(data=fcf_values, index=dates)
 
-    # ── Red Flag Detection ────────────────────────────────────────────────────
+    # ── Red Flag Detection ─────────────────────────────────────────────────────
     if (fcf_series < 0).all():
         debug["red_flags"].append(
-            "🚨 FCF is NEGATIVE across ALL periods — business is burning cash."
+            "🚨 FCF NEGATIVE across ALL periods — business is burning cash."
         )
     elif (fcf_series < 0).any():
         debug["red_flags"].append(
-            "⚠️ FCF turned negative in some periods — monitor the trend closely."
+            "⚠️ FCF turned negative in some periods — monitor the trend."
         )
 
-    ocf_vals = [
-        float(e.get("operatingCashFlow", 0))
-        for e in cashflow_data
-        if e.get("operatingCashFlow") is not None
-    ]
-    if ocf_vals and all(o > 0 for o in ocf_vals):
-        if (fcf_series < 0).any():
+    # Check if CapEx is eroding strong OCF
+    if len(fcf_values) >= 2:
+        if fcf_values[0] < fcf_values[1] * 0.8:
             debug["red_flags"].append(
-                "⚠️ High CapEx is consuming operating cash flow — growth investment phase."
+                "⚠️ FCF declining year-over-year — investigate CapEx or revenue trends."
             )
 
     return fcf_series, debug

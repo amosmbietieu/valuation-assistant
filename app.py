@@ -71,11 +71,21 @@ with st.sidebar:
     st.caption("Free key at [financialmodelingprep.com](https://financialmodelingprep.com)")
     fmp_key = st.text_input(
         "FMP API Key", type="password",
-        placeholder="Enter your FMP key…",
+        placeholder="Enter your Alpha Vantage key…",
         label_visibility="collapsed",
     )
-    if fmp_key:
-        st.success("✅ FMP key configured")
+    col_test, col_status = st.columns([1,2])
+    with col_test:
+        test_btn = st.button("Test key", use_container_width=True)
+    if test_btn and fmp_key:
+        from src.data_loader import test_api_key
+        ok, msg = test_api_key(fmp_key)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+    elif fmp_key:
+        st.success("✅ Key entered — click Test")
     else:
         st.warning("⚠️ Required for financial data")
 
@@ -128,9 +138,13 @@ if ticker and analyze:
 
     if data["error"]:
         st.error(f"❌ {data['error']}")
+        if data.get("_raw_errors"):
+            with st.expander("🔧 Technical details", expanded=False):
+                for e in data["_raw_errors"]:
+                    st.code(e)
         st.stop()
 
-    metrics = get_key_metrics(data["profile"], data["metrics"])
+    metrics = get_key_metrics(data["overview"], data["quote"])
     company_name = metrics.get("company_name", ticker)
 
     # ── Company Header ────────────────────────────────────────────────────────
@@ -292,16 +306,20 @@ if ticker and analyze:
     # ── Raw Statements ────────────────────────────────────────────────────────
     st.markdown("---")
     with st.expander("📂 Raw Financial Statements", expanded=False):
-        tab1, tab2, tab3 = st.tabs(["Cash Flow", "Income Statement", "Balance Sheet"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Cash Flow", "Income Statement", "Balance Sheet", "Overview"])
         with tab1:
             if data["cashflow"]:
-                st.dataframe(pd.DataFrame(data["cashflow"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(data["cashflow"]).set_index("fiscalDateEnding"), use_container_width=True)
         with tab2:
             if data["income"]:
-                st.dataframe(pd.DataFrame(data["income"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(data["income"]).set_index("fiscalDateEnding"), use_container_width=True)
         with tab3:
             if data["balance"]:
-                st.dataframe(pd.DataFrame(data["balance"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(data["balance"]).set_index("fiscalDateEnding"), use_container_width=True)
+        with tab4:
+            if data["overview"]:
+                ov_df = pd.DataFrame(list(data["overview"].items()), columns=["Field","Value"])
+                st.dataframe(ov_df.set_index("Field"), use_container_width=True)
 
     with st.expander("⚙️ Model Assumptions", expanded=False):
         st.markdown(f"""
@@ -325,13 +343,13 @@ elif not analyze:
             Enter a stock ticker to begin
         </div>
         <div style="font-size:.88rem;max-width:480px;margin:0 auto;line-height:1.7;">
-            Powered by <strong style="color:#00d4aa">Financial Modeling Prep</strong> data,
+            Powered by <strong style="color:#00d4aa">Alpha Vantage</strong> data,
             a <strong style="color:#4f8ef7">DCF valuation engine</strong>,
             and <strong style="color:#f0c040">Claude AI</strong>.
         </div>
         <br>
         <div style="font-size:.8rem;color:#4a4f6a;">
-            ① Enter your FMP key in the sidebar &nbsp;·&nbsp;
+            ① Enter your Alpha Vantage key in the sidebar &nbsp;·&nbsp;
             ② Enter a ticker &nbsp;·&nbsp;
             ③ Click Analyze
         </div>

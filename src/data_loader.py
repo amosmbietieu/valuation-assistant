@@ -1,144 +1,190 @@
 """
-data_loader.py — Financial Modeling Prep (FMP) Data Fetcher
-=============================================================
-Replaces yfinance with the FMP REST API, which works reliably
-on Streamlit Cloud without rate-limiting issues.
+data_loader.py — Alpha Vantage Data Fetcher
+=============================================
+Replaces FMP with Alpha Vantage — free, no rate-limit issues on Streamlit Cloud.
+Get your free API key instantly at: https://alphavantage.co/support/#api-key
 
-Free tier: 250 requests/day — sufficient for this app.
-Get your free API key at: https://financialmodelingprep.com
+Endpoints used (all free tier):
+  - CASH_FLOW        → operatingCashflow, capitalExpenditures
+  - INCOME_STATEMENT → totalRevenue, netIncome, ebitda
+  - BALANCE_SHEET    → totalAssets, totalLiabilities
+  - OVERVIEW         → market cap, P/E, sector, beta, shares outstanding
+  - GLOBAL_QUOTE     → current price
 """
 
 import requests
 import pandas as pd
 from typing import Optional
 
-BASE_URL = "https://financialmodelingprep.com/api/v3"
+BASE_URL = "https://www.alphavantage.co/query"
 
 
-def _get(endpoint: str, api_key: str, params: dict = None) -> Optional[list]:
+def _get(function: str, symbol: str, api_key: str) -> tuple:
     """
-    Make a GET request to the FMP API.
-    Returns parsed JSON list, or None on any error.
+    GET request to Alpha Vantage.
+    Returns (data: dict | None, error: str | None).
     """
-    url = f"{BASE_URL}/{endpoint}"
-    p = {"apikey": api_key, **(params or {})}
     try:
-        resp = requests.get(url, params=p, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        # FMP returns {"Error Message": "..."} on bad key / unknown ticker
-        if isinstance(data, dict) and "Error Message" in data:
-            return None
-        return data if isinstance(data, list) else None
-    except Exception:
-        return None
+        resp = requests.get(
+            BASE_URL,
+            params={"function": function, "symbol": symbol, "apikey": api_key},
+            timeout=20,
+        )
+        body = resp.json()
+
+        # Alpha Vantage signals errors in these keys
+        if "Error Message" in body:
+            return None, body["Error Message"]
+        if "Information" in body:          # rate limit message
+            return None, body["Information"]
+        if "Note" in body:                 # rate limit note
+            return None, body["Note"]
+
+        return body, None
+
+    except requests.exceptions.Timeout:
+        return None, "Request timed out. Try again."
+    except Exception as e:
+        return None, str(e)
+
+
+def test_api_key(api_key: str) -> tuple:
+    """
+    Quick test: fetch AAPL OVERVIEW.
+    Returns (ok: bool, message: str).
+    """
+    if not api_key or not api_key.strip():
+        return False, "No API key provided."
+
+    data, err = _get("OVERVIEW", "AAPL", api_key)
+    if err:
+        return False, f"API error: {err}"
+    if not data or "Symbol" not in data:
+        return False, "Key invalid or no data returned."
+    return True, f"✅ Key valid — connected to Alpha Vantage"
 
 
 def load_financials(ticker: str, api_key: str) -> dict:
     """
-    Fetch all financial statements for a ticker from FMP.
+    Fetch all financial data for a ticker from Alpha Vantage.
 
-    Args:
-        ticker  : Stock symbol (e.g., "AAPL", "MSFT")
-        api_key : FMP API key
-
-    Returns:
-        dict with keys:
-            - cashflow  : list of annual cash flow dicts
-            - income    : list of annual income statement dicts
-            - balance   : list of annual balance sheet dicts
-            - profile   : dict with company info + market data
-            - metrics   : dict with key valuation metrics
-            - ticker    : str
-            - error     : str | None
+    Returns dict with keys:
+        cashflow, income, balance, overview, quote, ticker, error
     """
     result = {
-        "cashflow": None,
-        "income":   None,
-        "balance":  None,
-        "profile":  {},
-        "metrics":  {},
-        "ticker":   ticker.upper().strip(),
-        "error":    None,
+        "cashflow":     None,
+        "income":       None,
+        "balance":      None,
+        "overview":     {},
+        "quote":        {},
+        "ticker":       ticker.upper().strip(),
+        "error":        None,
+        "_raw_errors":  [],
     }
 
     if not api_key or not api_key.strip():
         result["error"] = (
-            "FMP API key is missing. "
-            "Please enter your key in the sidebar. "
-            "Get a free key at financialmodelingprep.com"
+            "Alpha Vantage API key missing.\n"
+            "Get your free key instantly at: https://alphavantage.co/support/#api-key"
         )
         return result
 
     t = ticker.upper().strip()
 
-    # ── Cash Flow Statement ───────────────────────────────────────────────────
-    cf = _get(f"cash-flow-statement/{t}", api_key, {"limit": 5})
-    if cf:
-        result["cashflow"] = cf
+    # ── Cash Flow ─────────────────────────────────────────────────────────────
+    cf, err = _get("CASH_FLOW", t, api_key)
+    if err:
+        result["_raw_errors"].append(f"CASH_FLOW: {err}")
+    elif cf and cf.get("annualReports"):
+        result["cashflow"] = cf["annualReports"]   # list of annual dicts
 
     # ── Income Statement ──────────────────────────────────────────────────────
-    inc = _get(f"income-statement/{t}", api_key, {"limit": 5})
-    if inc:
-        result["income"] = inc
+    inc, err = _get("INCOME_STATEMENT", t, api_key)
+    if err:
+        result["_raw_errors"].append(f"INCOME_STATEMENT: {err}")
+    elif inc and inc.get("annualReports"):
+        result["income"] = inc["annualReports"]
 
     # ── Balance Sheet ─────────────────────────────────────────────────────────
-    bal = _get(f"balance-sheet-statement/{t}", api_key, {"limit": 5})
-    if bal:
-        result["balance"] = bal
+    bal, err = _get("BALANCE_SHEET", t, api_key)
+    if err:
+        result["_raw_errors"].append(f"BALANCE_SHEET: {err}")
+    elif bal and bal.get("annualReports"):
+        result["balance"] = bal["annualReports"]
 
-    # ── Company Profile (includes price, market cap, sector…) ────────────────
-    prof = _get(f"profile/{t}", api_key)
-    if prof and len(prof) > 0:
-        result["profile"] = prof[0]
+    # ── Company Overview (sector, P/E, market cap, beta…) ────────────────────
+    ov, err = _get("OVERVIEW", t, api_key)
+    if err:
+        result["_raw_errors"].append(f"OVERVIEW: {err}")
+    elif ov and "Symbol" in ov:
+        result["overview"] = ov
 
-    # ── Key Metrics (P/E, EV/EBITDA, ROE…) ───────────────────────────────────
-    met = _get(f"key-metrics/{t}", api_key, {"limit": 1})
-    if met and len(met) > 0:
-        result["metrics"] = met[0]
+    # ── Current Quote (live price) ────────────────────────────────────────────
+    qt, err = _get("GLOBAL_QUOTE", t, api_key)
+    if err:
+        result["_raw_errors"].append(f"GLOBAL_QUOTE: {err}")
+    elif qt and qt.get("Global Quote"):
+        result["quote"] = qt["Global Quote"]
 
     # ── Validity check ────────────────────────────────────────────────────────
-    if (
-        result["cashflow"] is None
-        and result["income"]  is None
-        and result["balance"] is None
-        and not result["profile"]
-    ):
-        result["error"] = (
-            f"No data found for '{ticker}'. "
-            "Check the ticker symbol. "
-            "Note: some non-US tickers require the exchange suffix (e.g. 'VOD.L')."
-        )
+    has_data = any([result["cashflow"], result["income"],
+                    result["balance"],  result["overview"]])
+
+    if not has_data:
+        raw = " | ".join(result["_raw_errors"])
+        if "rate limit" in raw.lower() or "api call frequency" in raw.lower():
+            result["error"] = (
+                "Rate limit reached (25 requests/day on free tier). "
+                "Wait until tomorrow or upgrade at alphavantage.co/premium"
+            )
+        elif "invalid api" in raw.lower() or not result["_raw_errors"]:
+            result["error"] = (
+                f"No data found for '{ticker}'. "
+                "Check the ticker symbol (e.g. AAPL, MSFT, TSLA). "
+                "Alpha Vantage covers US stocks and major international tickers."
+            )
+        else:
+            result["error"] = f"Could not fetch data for '{ticker}'. Details: {raw}"
 
     return result
 
 
-def get_key_metrics(profile: dict, metrics: dict) -> dict:
+def _safe_float(value) -> Optional[float]:
+    """Convert string or numeric to float, return None if invalid."""
+    try:
+        v = float(value)
+        return None if v == 0 else v
+    except (TypeError, ValueError):
+        return None
+
+
+def get_key_metrics(overview: dict, quote: dict) -> dict:
     """
-    Build a unified metrics dict from FMP profile + key-metrics endpoints.
-    Field names match the rest of the app exactly.
+    Build unified metrics dict from Alpha Vantage OVERVIEW + GLOBAL_QUOTE.
+    Alpha Vantage returns all numeric fields as strings — we convert here.
     """
+    # Current price: prefer live quote, fallback to overview's AnalystTargetPrice
+    price = _safe_float(quote.get("05. price")) or _safe_float(overview.get("50DayMovingAverage"))
+
     return {
-        "company_name":       profile.get("companyName", "N/A"),
-        "sector":             profile.get("sector", "N/A"),
-        "industry":           profile.get("industry", "N/A"),
-        "country":            profile.get("country", "N/A"),
-        "market_cap":         profile.get("mktCap"),
-        "current_price":      profile.get("price"),
-        "pe_ratio":           metrics.get("peRatio"),
-        "forward_pe":         None,   # not in FMP free tier
-        "peg_ratio":          metrics.get("pegRatio"),
-        "ev_ebitda":          metrics.get("enterpriseValueOverEBITDA"),
-        "debt_to_equity":     metrics.get("debtToEquity"),
-        "revenue_growth":     None,   # computed from income statements if needed
-        "earnings_growth":    None,
-        "profit_margin":      metrics.get("netProfitMargin"),
-        "roe":                metrics.get("roe"),
-        "beta":               profile.get("beta"),
-        "52w_high":           profile.get("range", "").split("-")[-1].strip() if profile.get("range") else None,
-        "52w_low":            profile.get("range", "").split("-")[0].strip() if profile.get("range") else None,
-        "shares_outstanding": profile.get("sharesOutstanding"),
-        "description":        profile.get("description", ""),
-        "website":            profile.get("website", ""),
-        "exchange":           profile.get("exchangeShortName", ""),
+        "company_name":       overview.get("Name", "N/A"),
+        "sector":             overview.get("Sector", "N/A"),
+        "industry":           overview.get("Industry", "N/A"),
+        "country":            overview.get("Country", "N/A"),
+        "exchange":           overview.get("Exchange", ""),
+        "market_cap":         _safe_float(overview.get("MarketCapitalization")),
+        "current_price":      price,
+        "pe_ratio":           _safe_float(overview.get("PERatio")),
+        "forward_pe":         _safe_float(overview.get("ForwardPE")),
+        "peg_ratio":          _safe_float(overview.get("PEGRatio")),
+        "ev_ebitda":          _safe_float(overview.get("EVToEBITDA")),
+        "debt_to_equity":     _safe_float(overview.get("DebtToEquityRatio")),
+        "profit_margin":      _safe_float(overview.get("ProfitMargin")),
+        "roe":                _safe_float(overview.get("ReturnOnEquityTTM")),
+        "beta":               _safe_float(overview.get("Beta")),
+        "52w_high":           _safe_float(overview.get("52WeekHigh")),
+        "52w_low":            _safe_float(overview.get("52WeekLow")),
+        "shares_outstanding": _safe_float(overview.get("SharesOutstanding")),
+        "description":        overview.get("Description", ""),
+        "website":            "",   # not in AV free tier
     }
