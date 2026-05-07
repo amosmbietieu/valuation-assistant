@@ -2,11 +2,47 @@
 data_loader.py — Yahoo Finance Data Fetcher
 ============================================
 Fetches and normalizes financial statements for a given ticker.
-Handles API inconsistencies, missing data, and transpose issues.
+Patches the yfinance session with browser-like headers to bypass
+Yahoo Finance rate limiting (HTTP 429 Too Many Requests).
 """
 
 import yfinance as yf
 import pandas as pd
+import requests
+
+# ─── Browser-like headers to bypass Yahoo Finance rate limiting ───────────────
+# Yahoo Finance blocks automated requests that don't look like a real browser.
+# We patch the yfinance session with these headers before any request is made.
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":  "document",
+    "Sec-Fetch-Mode":  "navigate",
+    "Sec-Fetch-Site":  "none",
+    "Sec-Fetch-User":  "?1",
+}
+
+
+def _make_ticker(ticker: str) -> yf.Ticker:
+    """
+    Create a yfinance Ticker with a patched session that sends
+    browser-like headers, bypassing Yahoo Finance rate limits.
+    """
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    return yf.Ticker(ticker, session=session)
 
 
 def load_financials(ticker: str) -> dict:
@@ -35,7 +71,7 @@ def load_financials(ticker: str) -> dict:
     }
 
     try:
-        stock = yf.Ticker(ticker)
+        stock = _make_ticker(ticker)
 
         # --- Cash Flow Statement ---
         cf = stock.cashflow
@@ -74,7 +110,18 @@ def load_financials(ticker: str) -> dict:
             )
 
     except Exception as e:
-        result["error"] = f"Data fetch failed for '{ticker}': {str(e)}"
+        err = str(e)
+        if "Too Many Requests" in err or "429" in err or "Rate" in err:
+            result["error"] = (
+                "Yahoo Finance rate limit reached. "
+                "Please wait 30 seconds and try again."
+            )
+        elif "No data found" in err or "404" in err:
+            result["error"] = (
+                f"Ticker '{ticker}' not found. Check the symbol and try again."
+            )
+        else:
+            result["error"] = f"Data fetch failed for '{ticker}': {err}"
 
     return result
 
